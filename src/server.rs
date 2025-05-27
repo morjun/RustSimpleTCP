@@ -12,32 +12,43 @@ struct Args {
     data_size: usize,
     #[arg(short, long, default_value = "0.0.0.0:7272")]
     address: String,
+
+    /// Maximum Segment Size (MSS) - 선택 사항
+    #[arg(long)]
+    mss: Option<usize>,
 }
 
-fn handle_client(mut stream: TcpStream, length: usize) -> io::Result<()> {
+fn handle_client(mut stream: TcpStream, total_data_size: usize, mss: Option<usize>) -> io::Result<()> {
     println!("클라이언트 연결: {}", stream.peer_addr()?);
 
-    let data = vec![0u8; length];
+    let chunk_size = mss.unwrap_or(1460); // MSS가 주어지지 않으면 기본값 사용
+    let mut sent_bytes = 0;
+    let data = vec![0u8; total_data_size];
 
-    println!("클라이언트에게 {}바이트 데이터를 보냅니다.", data.len());
+    println!("클라이언트에게 최대 {} 바이트씩 데이터를 보냅니다.", chunk_size);
 
-    stream.write_all(&data)?; // length 길의의 0으로 채워진 buffer를 그대로 씀
+    while sent_bytes < total_data_size {
+        let remaining = total_data_size - sent_bytes;
+        let send_len = std::cmp::min(chunk_size, remaining);
+
+        stream.write_all(&data[sent_bytes..sent_bytes + send_len])?;
+        sent_bytes += send_len;
+    }
     stream.flush()?;
-    println!(
-        "데이터 전송 완료. 클라이언트 연결 종료: {}",
-        stream.peer_addr()?
-    );
+
+    println!("총 {} 바이트 데이터 전송 완료. 클라이언트 연결 종료: {}", total_data_size, stream.peer_addr()?);
     Ok(())
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    let data_size = args.data_size;
+    let total_data_size = args.data_size;
     let address = &args.address;
     let address = address.parse::<SocketAddr>().unwrap();
+    let mss = args.mss;
 
     let listener = TcpListener::bind(address)?;
-    println!("서버 시작: {}, 보낼 데이터 크기: {} 바이트. 종료하려면 Enter 키를 누르세요.", address, data_size);
+    println!("서버 시작: {}, 보낼 데이터 크기: {} 바이트. 종료하려면 Enter 키를 누르세요.", address, total_data_size);
 
     let listener_arc = Arc::new(listener);
     let running = Arc::new(AtomicBool::new(true));
@@ -62,9 +73,16 @@ fn main() -> io::Result<()> {
         match listener_arc.accept() {
             Ok((stream, addr)) => {
                 println!("새로운 클라이언트 연결: {}", addr);
-                let cloned_data_size = data_size;
+                let cloned_total_data_size = total_data_size;
+                let cloned_mss = mss;
+                let running_client = running.clone();
                 thread::spawn(move || {
-                    handle_client(stream, cloned_data_size).unwrap_or_else(|error| eprintln!("{:?}", error));
+                    if running_client.load(Ordering::SeqCst) {
+                        handle_client(stream, cloned_total_data_size, cloned_mss)
+                            .unwrap_or_else(|error| eprintln!("{:?}", error));
+                    } else {
+                        println!("서버가 종료 중이므로 클라이언트 연결을 처리하지 않습니다.");
+                    }
                 });
             }
             Err(e) => {
